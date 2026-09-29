@@ -1,4 +1,47 @@
-interface QueueItem {
+export type PipelineStage =
+  | 'audioNormalization'
+  | 'transcription'
+  | 'summarization'
+  | 'generation';
+
+export interface PipelineSettings {
+  audioNormalization: {
+    parallel: boolean;
+  };
+  transcription: {
+    parallel: boolean;
+  };
+  summarization: {
+    parallel: boolean;
+  };
+  generation: {
+    parallel: boolean;
+  };
+}
+
+export const defaultPipelineSettings: PipelineSettings = {
+  audioNormalization: {
+    parallel: true,
+  },
+  transcription: {
+    parallel: false,
+  },
+  summarization: {
+    parallel: true,
+  },
+  generation: {
+    parallel: true,
+  },
+};
+
+export const PIPELINE_STAGES: PipelineStage[] = [
+  'audioNormalization',
+  'transcription',
+  'summarization',
+  'generation',
+];
+
+export interface QueueItem {
   id: string;
   userId: string;
   noteId: string;
@@ -7,28 +50,51 @@ interface QueueItem {
   markdownPath: string;
   language?: 'english' | 'other';
   status: 'queued' | 'processing' | 'completed' | 'error';
+  currentStage: PipelineStage;
+  stageStatus: 'waiting' | 'active' | 'completed' | 'error';
   progress: number;
   error?: string;
+  transcription?: string;
+  summary?: {
+    title: string;
+    description: string;
+    content: string;
+    noteClass?: string;
+  };
+  addedAt: number;
 }
 
 class ProcessingQueue {
   private queue: QueueItem[] = [];
-  private processing = false;
+  private cachedPipelineSettings: PipelineSettings = defaultPipelineSettings;
+  private lastSettingsFetch = 0;
+  private dispatching = false;
+  private needsRedispatch = false;
 
-  addItem(item: Omit<QueueItem, 'status' | 'progress'>): void {
+  addItem(item: {
+    id: string;
+    userId: string;
+    noteId: string;
+    originalPath: string;
+    mp3Path: string;
+    markdownPath: string;
+    language?: 'english' | 'other';
+  }): void {
     // Remove existing item with same ID if any to prevent duplicates during retry
     this.queue = this.queue.filter(q => q.id !== item.id);
 
-    this.queue.push({
+    const newItem: QueueItem = {
       ...item,
       language: item.language || 'english',
       status: 'queued',
+      currentStage: 'audioNormalization',
+      stageStatus: 'waiting',
       progress: 0,
-    });
+      addedAt: Date.now(),
+    };
 
-    if (!this.processing) {
-      this.processNext();
-    }
+    this.queue.push(newItem);
+    this.dispatch();
   }
 
   getItem(id: string): QueueItem | undefined {
@@ -36,151 +102,160 @@ class ProcessingQueue {
   }
 
   getQueuePosition(id: string): number {
-    const queuedItems = this.queue.filter(item => item.status === 'queued');
-    const index = queuedItems.findIndex(item => item.id === id);
-    return index + 1; // 1-based position
+    const item = this.getItem(id);
+    if (!item) return 0;
+    if (item.stageStatus === 'active' || item.status === 'completed') return 1;
+
+    const aheadInStage = this.queue.filter(
+      q => q.currentStage === item.currentStage &&
+           (q.stageStatus === 'active' || (q.stageStatus === 'waiting' && q.addedAt < item.addedAt))
+    ).length;
+
+    return aheadInStage + 1;
   }
 
   getQueueLength(): number {
-    return this.queue.filter(item => item.status === 'queued').length;
+    return this.queue.filter(item => item.status === 'queued' || item.stageStatus === 'waiting').length;
   }
 
-  private async processNext(): Promise<void> {
-    const nextItem = this.queue.find(item => item.status === 'queued');
+  updatePipelineSettings(settings: Partial<PipelineSettings>): void {
+    this.cachedPipelineSettings = {
+      ...this.cachedPipelineSettings,
+      ...settings,
+    };
+    this.lastSettingsFetch = Date.now();
+    this.dispatch();
+  }
 
-    if (!nextItem) {
-      this.processing = false;
+  async getPipelineSettings(): Promise<PipelineSettings> {
+    const now = Date.now();
+    // Cache for 2 seconds to avoid excessive database hits
+    if (now - this.lastSettingsFetch < 2000) {
+      return this.cachedPipelineSettings;
+    }
+
+    try {
+      const { getCollection } = await import('./db');
+      const globalSettingsCollection = await getCollection('global_settings');
+      const globalSettings = await globalSettingsCollection.findOne({ type: 'models' });
+      if (globalSettings?.settings?.pipeline) {
+        this.cachedPipelineSettings = {
+          audioNormalization: {
+            parallel: globalSettings.settings.pipeline.audioNormalization?.parallel ?? defaultPipelineSettings.audioNormalization.parallel,
+          },
+          transcription: {
+            parallel: globalSettings.settings.pipeline.transcription?.parallel ?? defaultPipelineSettings.transcription.parallel,
+          },
+          summarization: {
+            parallel: globalSettings.settings.pipeline.summarization?.parallel ?? defaultPipelineSettings.summarization.parallel,
+          },
+          generation: {
+            parallel: globalSettings.settings.pipeline.generation?.parallel ?? defaultPipelineSettings.generation.parallel,
+          },
+        };
+      }
+      this.lastSettingsFetch = now;
+    } catch {
+      // Keep cached on error
+    }
+
+    return this.cachedPipelineSettings;
+  }
+
+  private async getGlobalModelSettings(): Promise<any> {
+    const { getCollection } = await import('./db');
+    const globalSettingsCollection = await getCollection('global_settings');
+    const globalSettings = await globalSettingsCollection.findOne({ type: 'models' });
+
+    if (!globalSettings || !globalSettings.settings) {
+      throw new Error('Global API settings not found. Please ask an administrator to configure API settings.');
+    }
+
+    return globalSettings.settings;
+  }
+
+  private cleanupOldItems(): void {
+    const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+    this.queue = this.queue.filter(item => {
+      if (item.status === 'completed' || item.status === 'error') {
+        return item.addedAt > tenMinutesAgo;
+      }
+      return true;
+    });
+  }
+
+  async dispatch(): Promise<void> {
+    if (this.dispatching) {
+      this.needsRedispatch = true;
       return;
     }
 
-    this.processing = true;
-    await this.processItem(nextItem);
+    this.dispatching = true;
 
-    // Continue processing
-    setTimeout(() => this.processNext(), 100);
+    try {
+      do {
+        this.needsRedispatch = false;
+        this.cleanupOldItems();
+
+        const pipelineSettings = await this.getPipelineSettings();
+
+        for (const stage of PIPELINE_STAGES) {
+          const isParallel = pipelineSettings[stage]?.parallel ?? defaultPipelineSettings[stage].parallel;
+          const activeItems = this.queue.filter(q => q.currentStage === stage && q.stageStatus === 'active');
+          const waitingItems = this.queue.filter(q => q.currentStage === stage && q.stageStatus === 'waiting');
+
+          if (!isParallel) {
+            // Sequential mode: exactly 1 item can be active at a time for this stage
+            if (activeItems.length === 0 && waitingItems.length > 0) {
+              waitingItems.sort((a, b) => a.addedAt - b.addedAt);
+              const itemToProcess = waitingItems[0];
+              itemToProcess.stageStatus = 'active';
+              itemToProcess.status = 'processing';
+              this.executeStage(itemToProcess, stage).catch(err => {
+                console.error(`Error in stage '${stage}' for item ${itemToProcess.id}:`, err);
+              });
+            }
+          } else {
+            // Parallel mode: all waiting items run concurrently (up to safety limit)
+            const MAX_CONCURRENT = 10;
+            const availableSlots = Math.max(0, MAX_CONCURRENT - activeItems.length);
+            if (availableSlots > 0 && waitingItems.length > 0) {
+              waitingItems.sort((a, b) => a.addedAt - b.addedAt);
+              const itemsToProcess = waitingItems.slice(0, availableSlots);
+              for (const item of itemsToProcess) {
+                item.stageStatus = 'active';
+                item.status = 'processing';
+                this.executeStage(item, stage).catch(err => {
+                  console.error(`Error in stage '${stage}' for item ${item.id}:`, err);
+                });
+              }
+            }
+          }
+        }
+      } while (this.needsRedispatch);
+    } finally {
+      this.dispatching = false;
+    }
   }
 
-  private async processItem(item: QueueItem): Promise<void> {
+  private async executeStage(item: QueueItem, stage: PipelineStage): Promise<void> {
     try {
-      item.status = 'processing';
-      item.progress = 5;
-
-      // Import processing functions dynamically to avoid circular dependencies
-      const { convertAudioToMp3, transcribeAudio, summarizeText, saveMarkdownNote, generateFlashcards, generateQuiz } = await import('./processing');
-      const { deleteFile } = await import('./storage');
-      const { getCollection } = await import('./db');
-
-      // Convert audio to MP3
-      item.progress = 10;
-      await convertAudioToMp3(
-        item.originalPath,
-        item.mp3Path,
-        (progress) => {
-          item.progress = 10 + (progress * 0.3); // 10-40%
-        }
-      );
-
-      item.progress = 42;
-
-      // Get global admin settings
-      item.progress = 45;
-      const globalSettingsCollection = await getCollection('global_settings');
-      const globalSettings = await globalSettingsCollection.findOne({ type: 'models' });
-
-      if (!globalSettings || !globalSettings.settings) {
-        throw new Error('Global API settings not found. Please ask an administrator to configure API settings.');
+      if (stage === 'audioNormalization') {
+        await this.executeAudioNormalization(item);
+      } else if (stage === 'transcription') {
+        await this.executeTranscription(item);
+      } else if (stage === 'summarization') {
+        await this.executeSummarization(item);
+      } else if (stage === 'generation') {
+        await this.executeGeneration(item);
       }
-
-      const settings = globalSettings.settings;
-      item.progress = 50;
-
-      // Transcribe audio
-      let selectedModel;
-
-      // Handle backward compatibility for old STT structure
-      if (!settings.stt.english && !settings.stt.other) {
-        // Old structure - use the same settings for both languages
-        selectedModel = {
-          modelName: settings.stt.modelName || 'whisper-1',
-          task: settings.stt.task || 'transcribe',
-          temperature: settings.stt.temperature || 0.0,
-        };
-      } else {
-        // New structure - select based on language
-        selectedModel = item.language === 'english' ? settings.stt.english : settings.stt.other;
-      }
-
-      const transcription = await transcribeAudio(item.mp3Path, {
-        baseUrl: settings.stt.baseUrl,
-        apiKey: settings.stt.apiKey,
-        modelName: selectedModel.modelName,
-        task: selectedModel.task,
-        temperature: selectedModel.temperature,
-      });
-      item.progress = 70;
-
-      // Get user classes for classification
-      const userClassesCollection = await getCollection('user_classes');
-      const userClassDocs = await userClassesCollection.find({ userId: item.userId }).toArray();
-      const userClasses = userClassDocs.map(doc => doc.name);
-
-      // Summarize with LLM
-      const summary = await summarizeText(transcription, settings.llm, userClasses, 'summarization');
-      item.progress = 90;
-
-      // Save markdown file
-      item.progress = 92;
-      await saveMarkdownNote(item.markdownPath, summary.content);
-
-      // Save transcript as txt file
-      item.progress = 93;
-      const transcriptPath = item.markdownPath.replace(/\.md$/, '.txt');
-      await saveMarkdownNote(transcriptPath, transcription);
-
-      // Generate flashcards
-      item.progress = 94;
-      const flashcards = await generateFlashcards(summary.content, settings.llm);
-
-      // Generate quiz questions
-      item.progress = 95;
-      const quizQuestions = await generateQuiz(summary.content, settings.llm);
-
-      // Update database with the results
-      item.progress = 98;
-      const { ObjectId } = await import('mongodb');
-      const notesCollection = await getCollection('notes');
-      const updateData: any = {
-        title: summary.title,
-        description: summary.description,
-        content: summary.content,
-        flashcards,
-        quizQuestions,
-        status: 'completed',
-        updatedAt: new Date(),
-      };
-
-      if (summary.noteClass) {
-        updateData.noteClass = summary.noteClass;
-      }
-
-      await notesCollection.updateOne(
-        { _id: new ObjectId(item.noteId), userId: item.userId },
-        { $set: updateData }
-      );
-
-      // Delete original file after everything is saved successfully
-      deleteFile(item.originalPath);
-
-      item.status = 'completed';
-      item.progress = 100;
-
     } catch (error) {
-      console.error('Processing failed for item:', item.id, error);
+      console.error(`Processing failed at stage '${stage}' for item ${item.id}:`, error);
 
       item.status = 'error';
+      item.stageStatus = 'error';
       item.error = error instanceof Error ? error.message : 'Unknown error';
 
-      // Update database to reflect error status
       try {
         const { ObjectId } = await import('mongodb');
         const { getCollection } = await import('./db');
@@ -198,13 +273,160 @@ class ProcessingQueue {
       } catch (dbError) {
         console.error('Failed to update database with error status:', dbError);
       }
+    } finally {
+      // Trigger dispatch so the next item waiting in this stage or next stage can execute immediately
+      this.dispatch();
     }
+  }
+
+  private async executeAudioNormalization(item: QueueItem): Promise<void> {
+    const { convertAudioToMp3 } = await import('./processing');
+    item.progress = 10;
+
+    await convertAudioToMp3(
+      item.originalPath,
+      item.mp3Path,
+      (progress) => {
+        item.progress = Math.min(42, Math.round(10 + (progress * 0.3)));
+      }
+    );
+
+    item.progress = 42;
+    item.currentStage = 'transcription';
+    item.stageStatus = 'waiting';
+  }
+
+  private async executeTranscription(item: QueueItem): Promise<void> {
+    const { transcribeAudio } = await import('./processing');
+    const settings = await this.getGlobalModelSettings();
+    item.progress = 45;
+
+    let selectedModel;
+    if (!settings.stt.english && !settings.stt.other) {
+      selectedModel = {
+        modelName: settings.stt.modelName || 'whisper-1',
+        task: settings.stt.task || 'transcribe',
+        temperature: settings.stt.temperature || 0.0,
+      };
+    } else {
+      selectedModel = item.language === 'english' ? settings.stt.english : settings.stt.other;
+    }
+
+    item.progress = 50;
+    const transcription = await transcribeAudio(item.mp3Path, {
+      baseUrl: settings.stt.baseUrl,
+      apiKey: settings.stt.apiKey,
+      modelName: selectedModel.modelName,
+      task: selectedModel.task,
+      temperature: selectedModel.temperature,
+    });
+
+    item.transcription = transcription;
+    item.progress = 70;
+    item.currentStage = 'summarization';
+    item.stageStatus = 'waiting';
+  }
+
+  private async executeSummarization(item: QueueItem): Promise<void> {
+    const { summarizeText, saveMarkdownNote } = await import('./processing');
+    const { getCollection } = await import('./db');
+    const settings = await this.getGlobalModelSettings();
+
+    item.progress = 72;
+    const userClassesCollection = await getCollection('user_classes');
+    const userClassDocs = await userClassesCollection.find({ userId: item.userId }).toArray();
+    const userClasses = userClassDocs.map((doc: any) => doc.name);
+
+    if (!item.transcription) {
+      const transcriptPath = item.markdownPath.replace(/\.md$/, '.txt');
+      const { readFile, fileExists } = await import('./storage');
+      if (fileExists(transcriptPath)) {
+        item.transcription = readFile(transcriptPath).toString('utf-8');
+      } else {
+        throw new Error('Transcription missing for summarization step');
+      }
+    }
+
+    item.progress = 75;
+    const summary = await summarizeText(item.transcription, settings.llm, userClasses, 'summarization');
+    item.summary = summary;
+    item.progress = 90;
+
+    await saveMarkdownNote(item.markdownPath, summary.content);
+    item.progress = 92;
+
+    const transcriptPath = item.markdownPath.replace(/\.md$/, '.txt');
+    await saveMarkdownNote(transcriptPath, item.transcription);
+
+    item.currentStage = 'generation';
+    item.stageStatus = 'waiting';
+  }
+
+  private async executeGeneration(item: QueueItem): Promise<void> {
+    const { generateFlashcards, generateQuiz } = await import('./processing');
+    const { deleteFile } = await import('./storage');
+    const { getCollection } = await import('./db');
+    const { ObjectId } = await import('mongodb');
+    const settings = await this.getGlobalModelSettings();
+
+    item.progress = 93;
+
+    if (!item.summary?.content) {
+      const { readFile, fileExists } = await import('./storage');
+      if (fileExists(item.markdownPath)) {
+        const content = readFile(item.markdownPath).toString('utf-8');
+        item.summary = {
+          title: 'Note',
+          description: '',
+          content,
+        };
+      } else {
+        throw new Error('Summary content missing for study materials generation');
+      }
+    }
+
+    // Flashcards & Quiz generated concurrently
+    const [flashcards, quizQuestions] = await Promise.all([
+      generateFlashcards(item.summary.content, settings.llm),
+      generateQuiz(item.summary.content, settings.llm),
+    ]);
+
+    item.progress = 98;
+    const notesCollection = await getCollection('notes');
+    const updateData: any = {
+      title: item.summary.title,
+      description: item.summary.description,
+      content: item.summary.content,
+      flashcards,
+      quizQuestions,
+      status: 'completed',
+      updatedAt: new Date(),
+    };
+
+    if (item.summary.noteClass) {
+      updateData.noteClass = item.summary.noteClass;
+    }
+
+    await notesCollection.updateOne(
+      { _id: new ObjectId(item.noteId), userId: item.userId },
+      { $set: updateData }
+    );
+
+    // Clean up original raw audio to save space
+    deleteFile(item.originalPath);
+
+    item.status = 'completed';
+    item.stageStatus = 'completed';
+    item.progress = 100;
   }
 
   getProgress(id: string): {
     queueProgress: number;
     processProgress: number;
     status: string;
+    message?: string;
+    percent?: number;
+    error?: string;
   } {
     const item = this.getItem(id);
     if (!item) {
@@ -212,51 +434,87 @@ class ProcessingQueue {
         queueProgress: 0,
         processProgress: 0,
         status: 'not found',
+        message: 'Not found',
+        percent: 0,
       };
     }
 
-    const queuePosition = this.getQueuePosition(id);
-    const totalQueued = this.getQueueLength();
-
-    let queueProgress = 0;
-    if (item.status !== 'queued') {
-      queueProgress = 100;
-    } else if (totalQueued > 0) {
-      queueProgress = ((totalQueued - queuePosition + 1) / totalQueued) * 100;
+    if (item.status === 'completed') {
+      return {
+        queueProgress: 100,
+        processProgress: 100,
+        status: 'completed',
+        message: 'Complete',
+        percent: 100,
+      };
     }
+
+    if (item.status === 'error') {
+      return {
+        queueProgress: 0,
+        processProgress: item.progress,
+        status: `Error: ${item.error}`,
+        message: item.error || 'Processing failed',
+        percent: item.progress,
+        error: item.error,
+      };
+    }
+
+    const stage = item.currentStage;
+    const isWaiting = item.stageStatus === 'waiting';
+
+    const aheadInStage = isWaiting
+      ? this.queue.filter(
+          q => q.currentStage === stage &&
+               (q.stageStatus === 'active' || (q.stageStatus === 'waiting' && q.addedAt < item.addedAt))
+        ).length
+      : 0;
 
     let detailedStatus = '';
-    if (item.status === 'error') {
-      detailedStatus = `Error: ${item.error}`;
-    } else if (item.status === 'queued') {
-      detailedStatus = 'Waiting in queue...';
-    } else if (item.status === 'completed') {
-      detailedStatus = 'Complete';
-    } else if (item.status === 'processing') {
-      const progress = Math.round(item.progress);
-      if (progress < 10) {
-        detailedStatus = `Starting processing... (${progress}%)`;
-      } else if (progress < 40) {
-        detailedStatus = `Converting audio to MP3... (${progress}%)`;
-      } else if (progress < 50) {
-        detailedStatus = `Loading API settings... (${progress}%)`;
-      } else if (progress < 70) {
-        detailedStatus = `Transcribing audio to text... (${progress}%)`;
-      } else if (progress < 90) {
-        detailedStatus = `Generating AI summary... (${progress}%)`;
-      } else if (progress < 100) {
-        detailedStatus = `Saving markdown file... (${progress}%)`;
+    if (stage === 'audioNormalization') {
+      if (isWaiting) {
+        detailedStatus = aheadInStage > 0
+          ? `Waiting in queue for audio conversion (position ${aheadInStage + 1})...`
+          : 'Waiting for audio conversion...';
       } else {
-        detailedStatus = `Finalizing... (${progress}%)`;
+        detailedStatus = `Converting audio to MP3... (${Math.round(item.progress)}%)`;
       }
-    } else {
-      detailedStatus = item.status;
+    } else if (stage === 'transcription') {
+      if (isWaiting) {
+        detailedStatus = aheadInStage > 0
+          ? `Waiting in queue for transcription (position ${aheadInStage + 1})...`
+          : 'Waiting for transcription...';
+      } else {
+        detailedStatus = `Transcribing audio to text... (${Math.round(item.progress)}%)`;
+      }
+    } else if (stage === 'summarization') {
+      if (isWaiting) {
+        detailedStatus = aheadInStage > 0
+          ? `Waiting in queue for AI summary (position ${aheadInStage + 1})...`
+          : 'Waiting for AI summary...';
+      } else {
+        detailedStatus = `Generating AI summary... (${Math.round(item.progress)}%)`;
+      }
+    } else if (stage === 'generation') {
+      if (isWaiting) {
+        detailedStatus = aheadInStage > 0
+          ? `Waiting in queue for study materials...`
+          : 'Waiting for study materials...';
+      } else {
+        detailedStatus = `Generating flashcards & quiz... (${Math.round(item.progress)}%)`;
+      }
     }
+
+    const queueProgress = item.stageStatus === 'active'
+      ? 100
+      : Math.max(10, 100 - (aheadInStage * 25));
 
     return {
       queueProgress,
       processProgress: item.progress,
       status: detailedStatus,
+      message: detailedStatus,
+      percent: Math.round(item.progress),
     };
   }
 }

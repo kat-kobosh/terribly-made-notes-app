@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { auth } from '@clerk/nextjs/server';
 import { getCollection } from '@/lib/db';
 import { isUserAdmin } from '@/lib/admin';
+import { processingQueue, PipelineSettings, defaultPipelineSettings } from '@/lib/queue';
 
 interface GlobalModelSettings {
   stt: {
@@ -34,6 +35,7 @@ interface GlobalModelSettings {
     speed: number;
     sampleRate: number;
   };
+  pipeline: PipelineSettings;
 }
 
 const defaultGlobalSettings: GlobalModelSettings = {
@@ -67,6 +69,7 @@ const defaultGlobalSettings: GlobalModelSettings = {
     speed: 1.0,
     sampleRate: 22050,
   },
+  pipeline: defaultPipelineSettings,
 };
 
 export async function GET(request: NextRequest) {
@@ -104,6 +107,15 @@ export async function GET(request: NextRequest) {
             temperature: settings.stt.temperature || 0.0,
           },
         },
+      };
+    }
+
+    if (!settings.pipeline) {
+      settings.pipeline = defaultGlobalSettings.pipeline;
+    } else {
+      settings.pipeline = {
+        ...defaultGlobalSettings.pipeline,
+        ...settings.pipeline,
       };
     }
 
@@ -154,6 +166,10 @@ export async function POST(request: NextRequest) {
         createdBy: userId,
         updatedBy: userId,
       });
+    }
+
+    if (settings.pipeline) {
+      processingQueue.updatePipelineSettings(settings.pipeline);
     }
 
     return NextResponse.json({ message: 'Global model settings saved successfully' });

@@ -35,6 +35,20 @@ interface ModelSettings {
     speed: number;
     sampleRate: number;
   };
+  pipeline: {
+    audioNormalization: {
+      parallel: boolean;
+    };
+    transcription: {
+      parallel: boolean;
+    };
+    summarization: {
+      parallel: boolean;
+    };
+    generation: {
+      parallel: boolean;
+    };
+  };
 }
 
 export default function AdminModelsPage() {
@@ -70,6 +84,12 @@ export default function AdminModelsPage() {
       responseFormat: 'mp3',
       speed: 1.0,
       sampleRate: 22050,
+    },
+    pipeline: {
+      audioNormalization: { parallel: true },
+      transcription: { parallel: false },
+      summarization: { parallel: true },
+      generation: { parallel: true },
     },
   });
   const [loading, setLoading] = useState(true);
@@ -116,6 +136,23 @@ export default function AdminModelsPage() {
               task: data.stt.task || 'transcribe',
               temperature: data.stt.temperature || 0.0,
             },
+          };
+        }
+
+        // Ensure pipeline settings defaults
+        if (!data.pipeline) {
+          data.pipeline = {
+            audioNormalization: { parallel: true },
+            transcription: { parallel: false },
+            summarization: { parallel: true },
+            generation: { parallel: true },
+          };
+        } else {
+          data.pipeline = {
+            audioNormalization: { parallel: data.pipeline.audioNormalization?.parallel ?? true },
+            transcription: { parallel: data.pipeline.transcription?.parallel ?? false },
+            summarization: { parallel: data.pipeline.summarization?.parallel ?? true },
+            generation: { parallel: data.pipeline.generation?.parallel ?? true },
           };
         }
 
@@ -205,11 +242,131 @@ export default function AdminModelsPage() {
     }));
   };
 
+  const updatePipelineSetting = (stage: keyof ModelSettings['pipeline'], parallel: boolean) => {
+    setSettings(prev => ({
+      ...prev,
+      pipeline: {
+        ...prev.pipeline,
+        [stage]: {
+          parallel,
+        },
+      },
+    }));
+  };
+
   // Helper function to safely get nested STT settings
   const getSafeSTTSettings = () => ({
     english: settings.stt.english || { modelName: 'whisper-1', task: 'transcribe', temperature: 0.0 },
     other: settings.stt.other || { modelName: 'whisper-1', task: 'transcribe', temperature: 0.0 }
   });
+
+  const renderPipelineStepCard = (
+    key: keyof ModelSettings['pipeline'],
+    stepNumber: number,
+    title: string,
+    icon: string,
+    description: string,
+    behaviorNote: string
+  ) => {
+    const isParallel = settings.pipeline?.[key]?.parallel ?? true;
+
+    return (
+      <div
+        key={key}
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          padding: '16px 20px',
+          backgroundColor: '#ffffff',
+          border: '1px solid #e2e8f0',
+          borderRadius: '10px',
+          boxShadow: '0 1px 3px rgba(0, 0, 0, 0.04)',
+          gap: '16px',
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ flex: '1 1 340px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '1.25rem' }}>{icon}</span>
+            <span style={{ fontWeight: '600', fontSize: '1.05rem', color: '#1e293b' }}>
+              Step {stepNumber}: {title}
+            </span>
+            <span
+              style={{
+                fontSize: '0.75rem',
+                fontWeight: '600',
+                padding: '2px 10px',
+                borderRadius: '9999px',
+                backgroundColor: isParallel ? '#dcfce7' : '#fef3c7',
+                color: isParallel ? '#15803d' : '#92400e',
+                border: `1px solid ${isParallel ? '#86efac' : '#fde68a'}`,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              {isParallel ? '⚡ Parallel (All at once)' : '⏳ Sequential (1 at a time queue)'}
+            </span>
+          </div>
+          <p style={{ fontSize: '0.875rem', color: '#475569', margin: '0 0 4px 0', paddingLeft: '32px' }}>
+            {description}
+          </p>
+          <p style={{ fontSize: '0.785rem', color: '#94a3b8', margin: 0, paddingLeft: '32px' }}>
+            {behaviorNote}
+          </p>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <span
+            style={{
+              fontSize: '0.875rem',
+              fontWeight: '600',
+              color: isParallel ? '#16a34a' : '#64748b',
+              minWidth: '90px',
+              textAlign: 'right',
+            }}
+          >
+            {isParallel ? 'Parallel ON' : 'Parallel OFF'}
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={isParallel}
+            aria-label={`Toggle parallel processing for Step ${stepNumber}: ${title}`}
+            onClick={() => updatePipelineSetting(key, !isParallel)}
+            style={{
+              position: 'relative',
+              width: '52px',
+              height: '28px',
+              backgroundColor: isParallel ? '#2563eb' : '#cbd5e1',
+              borderRadius: '9999px',
+              border: 'none',
+              cursor: 'pointer',
+              transition: 'background-color 0.2s',
+              padding: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+            }}
+          >
+            <span
+              style={{
+                position: 'absolute',
+                top: '3px',
+                left: isParallel ? '26px' : '4px',
+                width: '22px',
+                height: '22px',
+                backgroundColor: '#ffffff',
+                borderRadius: '50%',
+                boxShadow: '0 1px 3px rgba(0, 0, 0, 0.25)',
+                transition: 'left 0.2s',
+              }}
+            />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   if (!isLoaded || loading) {
     return (
@@ -246,10 +403,60 @@ export default function AdminModelsPage() {
       </div>
 
       <div className="card">
-        <h2 style={{ marginBottom: '10px' }}>⚙️ API Settings</h2>
+        <h2 style={{ marginBottom: '10px' }}>⚙️ Admin & Pipeline Settings</h2>
         <p style={{ marginBottom: '30px', color: '#6b7280' }}>
-          Configure the AI API endpoints that will be used for all users. Only administrators can modify these settings.
+          Configure note processing pipeline concurrency and AI API endpoints for all users. Only administrators can modify these settings.
         </p>
+
+        {/* Pipeline & Parallel Processing Settings */}
+        <section style={{ marginBottom: '45px', borderBottom: '2px solid #f1f5f9', paddingBottom: '35px' }}>
+          <div style={{ marginBottom: '12px' }}>
+            <h3 style={{ fontSize: '1.5rem', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '8px', color: '#0f172a' }}>
+              <span>⚡</span> Note Processing Pipeline & Concurrency
+            </h3>
+            <p style={{ color: '#64748b', fontSize: '0.925rem', marginTop: '4px' }}>
+              Control whether each stage of the note processing pipeline runs in parallel (multiple notes processed concurrently) or sequentially (queued, 1 note at a time).
+            </p>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '20px' }}>
+            {renderPipelineStepCard(
+              'audioNormalization',
+              1,
+              'Audio Normalization (FFmpeg)',
+              '🎵',
+              'Converts uploaded audio files into standardized MP3 (128 kbps, 44.1 kHz).',
+              'When ON, all incoming notes convert audio simultaneously. When OFF, audio conversion runs one note at a time.'
+            )}
+
+            {renderPipelineStepCard(
+              'transcription',
+              2,
+              'Speech-to-Text Transcription (STT)',
+              '🎙️',
+              'Transcribes normalized MP3 audio into verbatim text via the configured STT model.',
+              'When ON, multiple transcriptions run simultaneously. When OFF, notes queue up and transcribe one by one to respect API rate limits.'
+            )}
+
+            {renderPipelineStepCard(
+              'summarization',
+              3,
+              'AI Summarization & Classification',
+              '📝',
+              'Generates structured Markdown study notes and assigns subject classes using LLM.',
+              'When ON, summarization runs concurrently for all transcribed notes. When OFF, notes summarize one at a time.'
+            )}
+
+            {renderPipelineStepCard(
+              'generation',
+              4,
+              'Study Materials Generation (Flashcards & Quiz)',
+              '🎴',
+              'Generates question/answer flashcards and interactive multiple-choice quiz questions.',
+              'When ON, study materials generate concurrently for all summarized notes. When OFF, generation runs sequentially.'
+            )}
+          </div>
+        </section>
 
         {/* STT Settings */}
         <section style={{ marginBottom: '40px' }}>
